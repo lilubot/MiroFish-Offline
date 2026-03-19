@@ -6,11 +6,12 @@ Provides interfaces for simulation report generation, retrieval, and conversatio
 import os
 import traceback
 import threading
-from flask import request, jsonify, send_file
+from flask import request, jsonify, send_file, current_app
 
 from . import report_bp
 from ..config import Config
 from ..services.report_agent import ReportAgent, ReportManager, ReportStatus
+from ..services.graph_tools import GraphToolsService
 from ..services.simulation_manager import SimulationManager
 from ..models.project import ProjectManager
 from ..models.task import TaskManager, TaskStatus
@@ -109,6 +110,14 @@ def generate_report():
         import uuid
         report_id = f"report_{uuid.uuid4().hex[:12]}"
 
+        # Capture GraphStorage before background thread starts
+        storage = current_app.extensions.get('neo4j_storage')
+        if not storage:
+            return jsonify({
+                "success": False,
+                "error": "GraphStorage not initialized - check Neo4j connection"
+            }), 500
+
         # Create async task
         task_manager = TaskManager()
         task_id = task_manager.create_task(
@@ -130,11 +139,13 @@ def generate_report():
                     message="Initializing Report Agent..."
                 )
                 
-                # Create Report Agent
+                # Create Report Agent with injected graph tools
+                tools = GraphToolsService(storage=storage)
                 agent = ReportAgent(
                     graph_id=graph_id,
                     simulation_id=simulation_id,
-                    simulation_requirement=simulation_requirement
+                    simulation_requirement=simulation_requirement,
+                    graph_tools=tools
                 )
 
                 # Progress callback
