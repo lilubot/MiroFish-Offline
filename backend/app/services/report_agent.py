@@ -551,6 +551,11 @@ Function Flow:
 PLAN_SYSTEM_PROMPT = """\
 You are an expert in writing "future prediction reports" with a "god's eye view" of the simulated world - you can gain insights into the behavior, statements, and interactions of every agent in the simulation.
 
+CRITICAL LANGUAGE REQUIREMENT: You MUST write ENTIRELY in English.
+Do NOT use Chinese, Japanese, Korean, or any non-English language anywhere in your output.
+Even if the source documents or simulation data contain non-English text, your report output must be 100% English.
+All titles, section headers, analysis, summaries, and conclusions must be in English.
+
 [Core Concept]
 We built a simulated world and injected specific "simulation requirements" as variables into it. The evolution result of the simulated world is a prediction of what might happen in the future. What you're observing is not "experimental data" but a "rehearsal of the future".
 
@@ -613,6 +618,11 @@ Based on the prediction results, design the most appropriate report section stru
 
 SECTION_SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert in writing "future prediction reports" and are writing a section of the report.
+
+CRITICAL LANGUAGE REQUIREMENT: You MUST write ENTIRELY in English.
+Do NOT use Chinese, Japanese, Korean, or any non-English language anywhere in your output.
+Even if the source documents or simulation data contain non-English text, you must translate everything to English.
+All section content, analysis, quotes (translated), and conclusions must be in English.
 
 Report Title: {report_title}
 Report Summary: {report_summary}
@@ -1534,6 +1544,95 @@ class ReportAgent:
         
         return final_answer
     
+    def _validate_section_output(self, content: str, section_title: str) -> str:
+        """
+        Validate and clean section output for encoding quality.
+
+        - Strips null bytes and most control characters
+        - Normalizes line endings
+        - Detects excessive non-ASCII content ratio; if > 20%, logs a warning
+          (re-generation is not triggered here to avoid breaking the ReACT flow,
+          but the caller can inspect the return value and decide)
+
+        Args:
+            content: Raw section content from LLM
+            section_title: Section title (used for log messages)
+
+        Returns:
+            Cleaned section content string
+        """
+        # Check non-ASCII ratio
+        non_ascii_ratio = sum(1 for c in content if ord(c) > 127) / max(len(content), 1)
+
+        if non_ascii_ratio > 0.2:
+            logger.warning(
+                f"Section '{section_title}' has {non_ascii_ratio:.1%} non-ASCII content — "
+                "possible language corruption. Consider re-generation."
+            )
+
+        # Strip null bytes
+        content = content.replace('\x00', '')
+
+        # Strip most control characters (keep tab \x09, LF \x0a, CR \x0d)
+        content = re.sub(r'[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]', '', content)
+
+        # Normalize line endings to LF
+        content = content.replace('\r\n', '\n').replace('\r', '\n')
+
+        return content
+
+    def _run_report_sanity_check(self, report_path: str) -> Dict[str, Any]:
+        """
+        Run a post-generation sanity check on the assembled full report.
+
+        Checks:
+        - Minimum section length (< 200 chars → warning)
+        - Unicode replacement characters (encoding corruption)
+        - High non-ASCII ratio (> 10% → language contamination warning)
+
+        Args:
+            report_path: Path to full_report.md
+
+        Returns:
+            dict with keys: issues (List[str]), section_count (int), total_chars (int)
+        """
+        if not os.path.exists(report_path):
+            return {"issues": [f"Report file not found: {report_path}"], "section_count": 0, "total_chars": 0}
+
+        with open(report_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+
+        issues: List[str] = []
+
+        # Check minimum section length
+        sections = content.split('## ')
+        for section in sections[1:]:
+            if len(section.strip()) < 200:
+                issues.append(f"Section too short (< 200 chars): {section[:50].strip()}...")
+
+        # Check for encoding artifacts
+        if '\ufffd' in content:
+            issues.append("Unicode replacement characters (\\ufffd) found — encoding corruption likely")
+
+        # Check for mixed language / non-ASCII ratio
+        total_chars = len(content)
+        non_ascii_ratio = sum(1 for c in content if ord(c) > 127) / max(total_chars, 1)
+        if non_ascii_ratio > 0.1:
+            issues.append(f"High non-ASCII ratio: {non_ascii_ratio:.1%} — possible language contamination")
+
+        result = {
+            "issues": issues,
+            "section_count": len(sections) - 1,
+            "total_chars": total_chars,
+        }
+
+        if issues:
+            logger.warning(f"Report sanity check found {len(issues)} issue(s): {issues}")
+        else:
+            logger.info(f"Report sanity check passed — {result['section_count']} sections, {total_chars} chars")
+
+        return result
+
     def generate_report(
         self, 
         progress_callback: Optional[Callable[[str, int, str], None]] = None,
@@ -1671,6 +1770,9 @@ class ReportAgent:
                     section_index=section_num
                 )
                 
+                # Validate and clean section output
+                section_content = self._validate_section_output(section_content, section.title)
+
                 section.content = section_content
                 generated_sections.append(f"## {section.title}\n\n{section_content}")
 
@@ -1712,6 +1814,12 @@ class ReportAgent:
             report.markdown_content = ReportManager.assemble_full_report(report_id, outline)
             report.status = ReportStatus.COMPLETED
             report.completed_at = datetime.now().isoformat()
+
+            # Run post-generation sanity check
+            full_report_path = ReportManager._get_report_markdown_path(report_id)
+            sanity_result = self._run_report_sanity_check(full_report_path)
+            if sanity_result.get("issues"):
+                logger.warning(f"Sanity check issues for report {report_id}: {sanity_result['issues']}")
             
             # Calculate total elapsed time
             total_time_seconds = (datetime.now() - start_time).total_seconds()
