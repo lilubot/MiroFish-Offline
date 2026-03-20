@@ -16,6 +16,8 @@ from .simulation_config_generator import (
     EventConfig,
     PlatformConfig
 )
+from .platform_simulators import PlatformSimulator, TwitterSimulator, RedditSimulator
+from .outcome_scorer import SimulationOutcome, OutcomeScorer
 from .simulation_runner import (
     SimulationRunner,
     SimulationRunState,
@@ -55,6 +57,11 @@ __all__ = [
     'TimeSimulationConfig',
     'EventConfig',
     'PlatformConfig',
+    'PlatformSimulator',
+    'TwitterSimulator',
+    'RedditSimulator',
+    'SimulationOutcome',
+    'OutcomeScorer',
     'SimulationRunner',
     'SimulationRunState',
     'RunnerStatus',

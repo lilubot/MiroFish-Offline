@@ -5,9 +5,12 @@ Reads nodes from Neo4j graph, filters out meaningful entity type nodes.
 Replaces zep_entity_reader.py — all Zep Cloud calls replaced by GraphStorage.
 """
 
+from difflib import SequenceMatcher
+import json
 from typing import Dict, Any, List, Optional, Set
 from dataclasses import dataclass, field
 
+from ..config import Config
 from ..utils.logger import get_logger
 from ..storage import GraphStorage
 
@@ -73,8 +76,15 @@ class EntityReader:
     3. Get related edges and linked node information for each entity
     """
 
-    def __init__(self, storage: GraphStorage):
+    def __init__(
+        self,
+        storage: GraphStorage,
+        ner_model: Optional[str] = None,
+        deduplication_threshold: float = 0.85,
+    ):
         self.storage = storage
+        self.ner_model = ner_model or Config.NER_MODEL
+        self.deduplication_threshold = deduplication_threshold
 
     def get_all_nodes(self, graph_id: str) -> List[Dict[str, Any]]:
         """
@@ -230,8 +240,20 @@ class EntityReader:
 
             filtered_entities.append(entity)
 
-        logger.info(f"Filter completed: total nodes {total_count}, matched {len(filtered_entities)}, "
-                     f"entity types: {entity_types_found}")
+        filtered_entities = self._deduplicate_entities(
+            filtered_entities,
+            similarity_threshold=self.deduplication_threshold,
+        )
+        entity_types_found = {
+            entity.get_entity_type()
+            for entity in filtered_entities
+            if entity.get_entity_type()
+        }
+
+        logger.info(
+            f"Filter completed: total nodes {total_count}, matched {len(filtered_entities)}, "
+            f"entity types: {entity_types_found}"
+        )
 
         return FilteredEntities(
             entities=filtered_entities,
@@ -338,3 +360,88 @@ class EntityReader:
             enrich_with_edges=enrich_with_edges
         )
         return result.entities
+
+    def _deduplicate_entities(
+        self,
+        entities: List[EntityNode],
+        similarity_threshold: float = 0.85,
+    ) -> List[EntityNode]:
+        """
+        Collapse near-duplicate entities using fuzzy name matching.
+
+        Only entities with the same resolved entity type are considered duplicates.
+        The first entity encountered remains canonical and absorbs merged context.
+        """
+        if len(entities) < 2:
+            return entities
+
+        deduplicated: List[EntityNode] = []
+
+        for entity in entities:
+            canonical_match = None
+            entity_type = entity.get_entity_type()
+            normalized_name = self._normalize_entity_name(entity.name)
+
+            for candidate in deduplicated:
+                candidate_type = candidate.get_entity_type()
+                if entity_type != candidate_type:
+                    continue
+
+                candidate_name = self._normalize_entity_name(candidate.name)
+                similarity = SequenceMatcher(None, normalized_name, candidate_name).ratio()
+                if similarity >= similarity_threshold:
+                    canonical_match = candidate
+                    break
+
+            if canonical_match is None:
+                deduplicated.append(entity)
+                continue
+
+            self._merge_entity_into_canonical(canonical_match, entity)
+
+        return deduplicated
+
+    @staticmethod
+    def _normalize_entity_name(name: str) -> str:
+        return " ".join((name or "").lower().split())
+
+    def _merge_entity_into_canonical(self, canonical: EntityNode, duplicate: EntityNode) -> None:
+        """Merge duplicate entity details into the canonical entity in place."""
+        canonical.labels = sorted(set(canonical.labels) | set(duplicate.labels))
+
+        if not canonical.summary and duplicate.summary:
+            canonical.summary = duplicate.summary
+        elif duplicate.summary and len(duplicate.summary) > len(canonical.summary):
+            canonical.summary = duplicate.summary
+
+        merged_attributes = dict(canonical.attributes)
+        for key, value in duplicate.attributes.items():
+            if key not in merged_attributes or not merged_attributes[key]:
+                merged_attributes[key] = value
+        canonical.attributes = merged_attributes
+
+        canonical.related_edges = self._merge_unique_dicts(
+            canonical.related_edges,
+            duplicate.related_edges,
+        )
+        canonical.related_nodes = self._merge_unique_dicts(
+            canonical.related_nodes,
+            duplicate.related_nodes,
+        )
+
+    @staticmethod
+    def _merge_unique_dicts(
+        existing_items: List[Dict[str, Any]],
+        incoming_items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        seen = set()
+        merged_items: List[Dict[str, Any]] = []
+
+        for item in existing_items + incoming_items:
+            marker = json.dumps(item, sort_keys=True, ensure_ascii=False)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            merged_items.append(item)
+
+        return merged_items
