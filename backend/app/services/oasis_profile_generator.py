@@ -56,6 +56,16 @@ class OasisAgentProfile:
     source_entity_type: Optional[str] = None
     
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
+
+    # --- Phase 2: Behavioral variance fields ---
+    # How likely the agent follows trends vs. holds personal views (0=contrarian, 1=total follower)
+    conformity: float = 0.5
+    # How quickly the agent responds to trending topics (0=slow, 1=instant)
+    reactiveness: float = 0.5
+    # How likely the agent changes stance when exposed to counter-arguments (0=stubborn, 1=easily swayed)
+    persuadability: float = 0.3
+    # Random behavior variance preventing fully mechanical simulation (0=deterministic, 1=chaotic)
+    behavioral_noise: float = 0.1
     
     def to_reddit_format(self) -> Dict[str, Any]:
         """Convert to Reddit platform format"""
@@ -1137,4 +1147,433 @@ Important:
         """[Deprecated] Please use save_profiles() method"""
         logger.warning("save_profiles_to_json is deprecated, please use save_profiles method")
         self.save_profiles(profiles, file_path, platform)
+
+
+# =============================================================================
+# Phase 2: FatigueState — agent engagement fatigue tracking
+# =============================================================================
+
+@dataclass
+class FatigueState:
+    """
+    Tracks an agent's engagement fatigue over simulation rounds.
+
+    Fatigue accumulates as the agent posts/comments and decays when the agent
+    is inactive.  The effective activity level is the agent's base rate minus
+    a fatigue penalty, clamped to a minimum so agents never go fully silent.
+
+    Usage example::
+
+        state = FatigueState(base_activity_level=0.8)
+        effective = state.get_current_activity_level(current_round=5)
+        # After acting: state.record_activity(current_round=5)
+    """
+
+    # Intrinsic activity level; does not change over the simulation (0.0-1.0)
+    base_activity_level: float = 0.5
+
+    # Accumulated fatigue in the current session; rises when acting, decays at rest (0.0-1.0)
+    fatigue_accumulation: float = 0.0
+
+    # Round number of the agent's most recent action (-1 = has never acted)
+    last_activity_round: int = -1
+
+    # How fast fatigue decays per idle round (tune empirically; 0.05 ≈ full recovery in ~20 rounds)
+    fatigue_decay_rate: float = 0.05
+
+    # How much fatigue accumulates per action
+    fatigue_per_action: float = 0.10
+
+    # Minimum effective activity (prevents agents going permanently silent)
+    min_activity_floor: float = 0.05
+
+    def get_current_activity_level(self, current_round: int) -> float:
+        """
+        Compute the effective activity level for *current_round*.
+
+        Fatigue decays linearly with idle time since the last action.
+        The result is clamped to [min_activity_floor, base_activity_level].
+
+        Args:
+            current_round: The simulation round number being evaluated.
+
+        Returns:
+            Effective activity level in [min_activity_floor, base_activity_level].
+        """
+        if self.last_activity_round < 0:
+            # Agent has never acted; no fatigue yet
+            return self.base_activity_level
+
+        rounds_idle = max(0, current_round - self.last_activity_round)
+        current_fatigue = max(0.0, self.fatigue_accumulation - rounds_idle * self.fatigue_decay_rate)
+
+        effective = self.base_activity_level * (1.0 - current_fatigue)
+        return max(self.min_activity_floor, min(self.base_activity_level, effective))
+
+    def record_activity(self, current_round: int) -> None:
+        """
+        Update fatigue state after the agent acts in *current_round*.
+
+        Should be called once per action taken.
+
+        Args:
+            current_round: The simulation round in which the action occurred.
+        """
+        # Decay any existing fatigue first for the idle period
+        if self.last_activity_round >= 0:
+            rounds_idle = max(0, current_round - self.last_activity_round)
+            self.fatigue_accumulation = max(
+                0.0, self.fatigue_accumulation - rounds_idle * self.fatigue_decay_rate
+            )
+
+        # Then add new fatigue for this action and mark the round
+        self.fatigue_accumulation = min(1.0, self.fatigue_accumulation + self.fatigue_per_action)
+        self.last_activity_round = current_round
+
+    def record_rest(self, current_round: int) -> None:
+        """
+        Passive fatigue decay when the agent skips a round.
+
+        Args:
+            current_round: The simulation round being skipped.
+        """
+        if self.last_activity_round >= 0:
+            rounds_idle = max(0, current_round - self.last_activity_round)
+            self.fatigue_accumulation = max(
+                0.0, self.fatigue_accumulation - rounds_idle * self.fatigue_decay_rate
+            )
+
+
+# =============================================================================
+# Phase 2: ArchetypePersonaGenerator — synthetic personas from seed archetypes
+# =============================================================================
+
+# Default archetype definitions; each entry maps archetype name → behavioral defaults
+_ARCHETYPE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "Enthusiast": {
+        "conformity": 0.7,
+        "reactiveness": 0.8,
+        "persuadability": 0.5,
+        "behavioral_noise": 0.15,
+        "sentiment_bias_range": (0.4, 0.9),
+        "stance": "supportive",
+        "activity_level_range": (0.6, 0.9),
+    },
+    "Skeptic": {
+        "conformity": 0.3,
+        "reactiveness": 0.5,
+        "persuadability": 0.2,
+        "behavioral_noise": 0.1,
+        "sentiment_bias_range": (-0.7, -0.2),
+        "stance": "opposing",
+        "activity_level_range": (0.4, 0.7),
+    },
+    "Neutral": {
+        "conformity": 0.5,
+        "reactiveness": 0.4,
+        "persuadability": 0.5,
+        "behavioral_noise": 0.1,
+        "sentiment_bias_range": (-0.2, 0.2),
+        "stance": "neutral",
+        "activity_level_range": (0.3, 0.6),
+    },
+    "Influencer": {
+        "conformity": 0.4,
+        "reactiveness": 0.9,
+        "persuadability": 0.3,
+        "behavioral_noise": 0.2,
+        "sentiment_bias_range": (0.1, 0.7),
+        "stance": "supportive",
+        "activity_level_range": (0.7, 1.0),
+    },
+    "Contrarian": {
+        "conformity": 0.1,
+        "reactiveness": 0.6,
+        "persuadability": 0.1,
+        "behavioral_noise": 0.25,
+        "sentiment_bias_range": (-0.9, -0.3),
+        "stance": "opposing",
+        "activity_level_range": (0.5, 0.8),
+    },
+}
+
+
+class ArchetypePersonaGenerator:
+    """
+    Generates synthetic OASIS agent personas from a fixed set of seed archetypes.
+
+    Two-tier persona model
+    ─────────────────────
+    * **Seed personas** (real): high-fidelity, named, derived from document entities.
+    * **Archetype personas** (synthetic): generated here from behavioral templates,
+      scaled to populate a realistic crowd around the seed population.
+
+    Archetypes
+    ──────────
+    Enthusiast, Skeptic, Neutral, Influencer, Contrarian — each has predefined
+    behavioral defaults (conformity, reactiveness, persuadability, behavioral_noise)
+    with small random variance applied so no two synthetic agents are identical.
+
+    Usage::
+
+        gen = ArchetypePersonaGenerator(seed_profiles, archetype_count=20)
+        synthetic = gen.generate_synthetic_personas(next_user_id_start=len(seed_profiles))
+
+    Args:
+        seed_personas: Profiles already created from document entities.
+        archetype_count: Total number of synthetic personas to generate (split evenly
+            across archetypes; remainder goes to Neutral).
+        archetypes: Override the list of archetype names to use.  Defaults to all five.
+        llm_client: Optional OpenAI-compatible client for LLM-assisted name/bio
+            generation.  If None, rule-based generation is used.
+        model_name: LLM model name (used only when llm_client is provided).
+    """
+
+    DEFAULT_ARCHETYPES = list(_ARCHETYPE_DEFAULTS.keys())
+
+    def __init__(
+        self,
+        seed_personas: List[OasisAgentProfile],
+        archetype_count: int = 10,
+        archetypes: Optional[List[str]] = None,
+        llm_client=None,
+        model_name: Optional[str] = None,
+    ):
+        self.seed_personas = seed_personas
+        self.archetype_count = max(1, archetype_count)
+        self.archetypes = archetypes or self.DEFAULT_ARCHETYPES
+        self.llm_client = llm_client
+        self.model_name = model_name
+
+        # Validate archetype names
+        for name in self.archetypes:
+            if name not in _ARCHETYPE_DEFAULTS:
+                raise ValueError(
+                    f"Unknown archetype '{name}'. "
+                    f"Valid options: {list(_ARCHETYPE_DEFAULTS.keys())}"
+                )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate_synthetic_personas(
+        self, next_user_id_start: int = 0
+    ) -> List[OasisAgentProfile]:
+        """
+        Generate synthetic personas distributed across all configured archetypes.
+
+        Args:
+            next_user_id_start: user_id to assign to the first generated persona.
+                Subsequent personas get sequential IDs.
+
+        Returns:
+            List of synthetic OasisAgentProfile instances.
+        """
+        num_archetypes = len(self.archetypes)
+        per_archetype = self.archetype_count // num_archetypes
+        remainder = self.archetype_count % num_archetypes
+
+        synthetic: List[OasisAgentProfile] = []
+        uid = next_user_id_start
+
+        for i, archetype in enumerate(self.archetypes):
+            # Distribute remainder to earlier archetypes
+            count = per_archetype + (1 if i < remainder else 0)
+            for variant in range(count):
+                profile = self._generate_persona_for_archetype(archetype, variant, uid)
+                synthetic.append(profile)
+                uid += 1
+
+        logger.info(
+            f"ArchetypePersonaGenerator: generated {len(synthetic)} synthetic personas "
+            f"across {num_archetypes} archetypes"
+        )
+        return synthetic
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _generate_persona_for_archetype(
+        self, archetype: str, variant: int, user_id: int
+    ) -> OasisAgentProfile:
+        """
+        Create a single synthetic persona for *archetype*.
+
+        Behavioral fields are drawn from the archetype template with small
+        Gaussian noise applied so agents in the same archetype differ.
+
+        Args:
+            archetype: One of the archetype names in _ARCHETYPE_DEFAULTS.
+            variant: Zero-based index within the archetype batch (used for
+                seeding name/username variance).
+            user_id: Integer user_id for the new profile.
+
+        Returns:
+            A fully populated OasisAgentProfile.
+        """
+        defaults = _ARCHETYPE_DEFAULTS[archetype]
+
+        # --- Behavioral variance with small noise ---
+        def jitter(value: float, noise: float = 0.08) -> float:
+            return float(max(0.0, min(1.0, value + random.gauss(0, noise))))
+
+        conformity = jitter(defaults["conformity"])
+        reactiveness = jitter(defaults["reactiveness"])
+        persuadability = jitter(defaults["persuadability"])
+        behavioral_noise = jitter(defaults["behavioral_noise"], noise=0.04)
+
+        # Sentiment bias sampled uniformly within archetype range
+        s_lo, s_hi = defaults["sentiment_bias_range"]
+        sentiment_bias = round(random.uniform(s_lo, s_hi), 3)
+
+        # Activity level
+        a_lo, a_hi = defaults["activity_level_range"]
+        activity_level = round(random.uniform(a_lo, a_hi), 3)
+
+        # Social graph metrics scaled loosely by archetype
+        follower_multiplier = 3.0 if archetype == "Influencer" else 1.0
+        follower_count = int(random.randint(100, 1000) * follower_multiplier)
+        friend_count = random.randint(50, 500)
+        statuses_count = random.randint(100, 3000)
+
+        # Archetype-flavoured name/bio
+        name, username, bio, persona_text = self._generate_identity(archetype, variant, user_id)
+
+        profile = OasisAgentProfile(
+            user_id=user_id,
+            user_name=username,
+            name=name,
+            bio=bio,
+            persona=persona_text,
+            karma=random.randint(200, 8000),
+            friend_count=friend_count,
+            follower_count=follower_count,
+            statuses_count=statuses_count,
+            age=random.randint(18, 60),
+            gender=random.choice(["male", "female"]),
+            mbti=random.choice(OasisProfileGenerator.MBTI_TYPES),
+            country=random.choice(OasisProfileGenerator.COUNTRIES),
+            profession=self._archetype_profession(archetype),
+            interested_topics=self._archetype_topics(archetype),
+            source_entity_uuid=None,
+            source_entity_type=f"synthetic:{archetype}",
+            # Phase 2 behavioral variance
+            conformity=round(conformity, 3),
+            reactiveness=round(reactiveness, 3),
+            persuadability=round(persuadability, 3),
+            behavioral_noise=round(behavioral_noise, 3),
+        )
+        return profile
+
+    def _generate_identity(
+        self, archetype: str, variant: int, user_id: int
+    ) -> tuple:
+        """
+        Return (name, username, bio, persona) for a synthetic persona.
+
+        Uses LLM when a client is available; falls back to rule-based templates.
+        """
+        if self.llm_client and self.model_name:
+            return self._llm_identity(archetype, variant)
+        return self._rule_based_identity(archetype, variant, user_id)
+
+    def _llm_identity(self, archetype: str, variant: int) -> tuple:
+        """Generate identity fields via LLM."""
+        prompt = (
+            f"Generate a realistic social media persona for a '{archetype}' archetype.\n"
+            f"This is variant #{variant + 1}.\n"
+            f"Return JSON with keys: name, username, bio (≤160 chars), persona (≤400 chars).\n"
+            f"The persona should reflect the '{archetype}' behavioral pattern authentically."
+        )
+        try:
+            resp = self.llm_client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "You generate realistic social media user profiles. Return pure JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.85,
+            )
+            data = json.loads(resp.choices[0].message.content)
+            name = data.get("name", f"User_{archetype}_{variant}")
+            username = data.get("username", f"user_{archetype.lower()}_{variant}_{random.randint(100,999)}")
+            bio = data.get("bio", f"A {archetype.lower()} observer of current events.")
+            persona = data.get("persona", f"Synthetic {archetype} persona.")
+            return name, username, bio, persona
+        except Exception as e:
+            logger.warning(f"LLM identity generation failed for archetype {archetype}: {e}")
+            return self._rule_based_identity(archetype, variant, random.randint(1000, 9999))
+
+    def _rule_based_identity(self, archetype: str, variant: int, user_id: int) -> tuple:
+        """Deterministic rule-based identity for a synthetic persona."""
+        first_names = [
+            "Alex", "Jordan", "Morgan", "Taylor", "Casey",
+            "Riley", "Cameron", "Avery", "Quinn", "Blake",
+        ]
+        last_names = [
+            "Smith", "Chen", "Rivera", "Patel", "Kim",
+            "Brown", "Davis", "Wilson", "Martinez", "Lee",
+        ]
+        first = first_names[user_id % len(first_names)]
+        last = last_names[(user_id // len(first_names)) % len(last_names)]
+        name = f"{first} {last}"
+        username = f"{first.lower()}_{last.lower()}_{random.randint(10, 99)}"
+
+        bio_templates = {
+            "Enthusiast": f"Passionate about innovation and progress. Always excited to discuss new ideas. #{archetype}",
+            "Skeptic": f"I question everything. Critical thinker. Not buying the hype.",
+            "Neutral": f"Just here to read and stay informed. Opinions are my own.",
+            "Influencer": f"Content creator | thought leader | {random.randint(1, 50)}K followers. Let's connect!",
+            "Contrarian": f"If everyone agrees, someone is wrong. Usually them.",
+        }
+        persona_templates = {
+            "Enthusiast": (
+                f"{name} is an avid follower of current trends and jumps at the chance to engage with new ideas. "
+                f"They share content frequently, tend to amplify positive narratives, and often recruit others to their views."
+            ),
+            "Skeptic": (
+                f"{name} approaches every claim with healthy scepticism. They ask probing questions, "
+                f"challenge official narratives, and rarely change their mind without hard evidence."
+            ),
+            "Neutral": (
+                f"{name} reads widely but posts sparingly. They prefer to understand all sides before "
+                f"forming an opinion and rarely take public stances on divisive issues."
+            ),
+            "Influencer": (
+                f"{name} has a significant online following and knows how to craft messages that resonate. "
+                f"They are highly reactive to trends and their posts often kickstart broader conversations."
+            ),
+            "Contrarian": (
+                f"{name} instinctively pushes back against consensus. They relish pointing out flaws in "
+                f"popular positions and are unafraid of controversy, though this sometimes alienates allies."
+            ),
+        }
+        bio = bio_templates.get(archetype, f"Synthetic {archetype} persona #{variant}")
+        persona = persona_templates.get(archetype, f"{name} is a synthetic {archetype.lower()} agent.")
+        return name, username, bio, persona
+
+    @staticmethod
+    def _archetype_profession(archetype: str) -> str:
+        professions = {
+            "Enthusiast": "Tech enthusiast / early adopter",
+            "Skeptic": "Journalist / researcher",
+            "Neutral": "General public",
+            "Influencer": "Content creator / blogger",
+            "Contrarian": "Independent commentator",
+        }
+        return professions.get(archetype, "Social media user")
+
+    @staticmethod
+    def _archetype_topics(archetype: str) -> List[str]:
+        topics = {
+            "Enthusiast": ["Technology", "Innovation", "Science", "Startups"],
+            "Skeptic": ["Politics", "Media criticism", "Fact-checking", "Research"],
+            "Neutral": ["General news", "Local events", "Lifestyle"],
+            "Influencer": ["Trending topics", "Social issues", "Pop culture", "Tech"],
+            "Contrarian": ["Politics", "Economics", "Philosophy", "Conspiracy theories"],
+        }
+        return topics.get(archetype, ["General"])
 

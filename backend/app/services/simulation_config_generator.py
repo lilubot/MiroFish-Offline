@@ -983,5 +983,326 @@ Return JSON format (no markdown):
                 "stance": "neutral",
                 "influence_weight": 1.0
             }
-    
+
+
+# =============================================================================
+# Phase 2: MultiFrameInitializer — competing narrative frames at t=0
+# =============================================================================
+
+import random as _random
+
+@dataclass
+class NarrativeFrame:
+    """
+    Represents one particular framing of the story at simulation start.
+
+    Example frames for "AI startup raises $100M funding":
+    - positive: "Huge vote of confidence in AI; good for innovation"
+    - skeptical: "Another AI bubble; what will really change?"
+    - concerned: "Centralised AI power; bad for society"
+    - technical: "Interesting approach, but does it scale?"
+    """
+    frame_id: str          # Unique identifier, e.g. "positive", "skeptical"
+    label: str             # Human-readable label
+    description: str       # 2-3 sentence explanation of this framing
+    initial_sentiment: float  # -1.0 (very negative) to 1.0 (very positive)
+    talking_points: List[str] = field(default_factory=list)
+    agent_ids: List[int] = field(default_factory=list)  # Agents assigned to this frame
+
+
+class MultiFrameInitializer:
+    """
+    Creates N competing narrative frames at t=0 and distributes agents to them.
+
+    Each frame represents a distinct interpretive lens through which a sub-group
+    of agents views the story.  Frames are generated via LLM (when a client is
+    provided) or via heuristic templates; agents are assigned based on their
+    ``sentiment_bias`` field from ``AgentActivityConfig``.
+
+    Usage::
+
+        init = MultiFrameInitializer(story_content, num_frames=4, llm_client=client, model_name="...")
+        frames = init.frames
+        assignments = init.distribute_agents(agent_configs)
+
+    Args:
+        story_content: The raw document text or simulation-requirement string
+            that describes the narrative being simulated.
+        num_frames: Number of competing frames to generate (2–8 recommended).
+        llm_client: Optional OpenAI-compatible client.  When None, rule-based
+            frame generation is used.
+        model_name: LLM model name string.
+    """
+
+    # Sentiment thresholds for frame assignment
+    POSITIVE_THRESHOLD = 0.3
+    NEGATIVE_THRESHOLD = -0.3
+
+    def __init__(
+        self,
+        story_content: str,
+        num_frames: int = 4,
+        llm_client=None,
+        model_name: Optional[str] = None,
+    ):
+        if num_frames < 2:
+            raise ValueError("num_frames must be at least 2 to create competing narratives")
+
+        self.story_content = story_content
+        self.num_frames = num_frames
+        self.llm_client = llm_client
+        self.model_name = model_name
+
+        self.frames: List[NarrativeFrame] = self._generate_frames()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def distribute_agents(
+        self, agent_configs: List[AgentActivityConfig]
+    ) -> Dict[str, List[int]]:
+        """
+        Assign each agent to the frame that best matches their ``sentiment_bias``.
+
+        Positive-biased agents → most positive frame.
+        Negative-biased agents → most negative frame.
+        Neutral agents are split evenly across middle frames.
+
+        Also populates ``frame.agent_ids`` on each NarrativeFrame for convenience.
+
+        Args:
+            agent_configs: List of AgentActivityConfig produced by the generator.
+
+        Returns:
+            Dict mapping frame_id → list of agent_ids assigned to that frame.
+        """
+        # Sort frames by initial_sentiment ascending so index maps cleanly
+        sorted_frames = sorted(self.frames, key=lambda f: f.initial_sentiment)
+        frame_assignments: Dict[str, List[int]] = {f.frame_id: [] for f in sorted_frames}
+
+        # Clear any prior assignments on frame objects
+        for frame in sorted_frames:
+            frame.agent_ids = []
+
+        num_frames = len(sorted_frames)
+
+        for agent in agent_configs:
+            bias = getattr(agent, "sentiment_bias", 0.0)
+            frame = self._find_best_frame(bias, sorted_frames)
+            frame_assignments[frame.frame_id].append(agent.agent_id)
+            frame.agent_ids.append(agent.agent_id)
+
+        # Log distribution
+        for frame in sorted_frames:
+            logger.info(
+                f"MultiFrameInitializer: frame '{frame.frame_id}' "
+                f"({frame.initial_sentiment:+.2f}) → {len(frame.agent_ids)} agents"
+            )
+
+        return frame_assignments
+
+    # ------------------------------------------------------------------
+    # Frame generation
+    # ------------------------------------------------------------------
+
+    def _generate_frames(self) -> List[NarrativeFrame]:
+        """Generate NarrativeFrame objects via LLM or rule-based fallback."""
+        if self.llm_client and self.model_name:
+            try:
+                return self._generate_frames_llm()
+            except Exception as e:
+                logger.warning(f"MultiFrameInitializer: LLM frame generation failed ({e}), using rule-based fallback")
+        return self._generate_frames_rule_based()
+
+    def _generate_frames_llm(self) -> List[NarrativeFrame]:
+        """Use LLM to produce N alternative narrative framings of the story."""
+        story_snippet = self.story_content[:2000]
+
+        prompt = (
+            f"Given this story:\n\n{story_snippet}\n\n"
+            f"Generate {self.num_frames} distinct ways different people could frame or interpret this story.\n"
+            f"For each frame provide:\n"
+            f"  - frame_id: short snake_case identifier (e.g. positive, skeptical, concerned)\n"
+            f"  - label: concise human-readable label\n"
+            f"  - description: 2-3 sentences describing this interpretive lens\n"
+            f"  - initial_sentiment: float from -1.0 (very negative) to 1.0 (very positive)\n"
+            f"  - talking_points: list of 3-5 representative talking points\n\n"
+            f"Ensure frames cover a spectrum from positive to negative.\n"
+            f"Return JSON: {{\"frames\": [ ... ]}}"
+        )
+
+        response = self.llm_client.chat.completions.create(
+            model=self.model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a social narrative analyst. "
+                        "Return pure JSON only. No markdown, no explanation."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.8,
+        )
+
+        raw = json.loads(response.choices[0].message.content)
+        frames_data = raw.get("frames", [])
+
+        frames: List[NarrativeFrame] = []
+        for item in frames_data[: self.num_frames]:
+            frames.append(
+                NarrativeFrame(
+                    frame_id=item.get("frame_id", f"frame_{len(frames)}"),
+                    label=item.get("label", item.get("frame_id", "Frame")),
+                    description=item.get("description", ""),
+                    initial_sentiment=float(item.get("initial_sentiment", 0.0)),
+                    talking_points=item.get("talking_points", []),
+                )
+            )
+
+        if not frames:
+            raise ValueError("LLM returned no valid frames")
+
+        logger.info(f"MultiFrameInitializer: generated {len(frames)} frames via LLM")
+        return frames
+
+    def _generate_frames_rule_based(self) -> List[NarrativeFrame]:
+        """
+        Heuristic frame generation covering a sentiment spectrum.
+
+        Uses a fixed set of archetypes and trims/extends to exactly num_frames.
+        """
+        template_pool: List[Dict[str, Any]] = [
+            {
+                "frame_id": "positive",
+                "label": "Positive / Optimistic",
+                "description": (
+                    "This group interprets the story as fundamentally good news. "
+                    "They highlight benefits, progress, and opportunities, and "
+                    "actively share upbeat takes."
+                ),
+                "initial_sentiment": 0.7,
+                "talking_points": [
+                    "This is a significant step forward.",
+                    "The benefits far outweigh any concerns.",
+                    "We should celebrate this progress.",
+                ],
+            },
+            {
+                "frame_id": "supportive",
+                "label": "Supportive / Constructive",
+                "description": (
+                    "Broadly in favour but with nuanced caveats. "
+                    "They want to see it succeed and offer constructive feedback."
+                ),
+                "initial_sentiment": 0.4,
+                "talking_points": [
+                    "Good direction overall, though execution matters.",
+                    "Let's make sure the details are done right.",
+                    "Cautious optimism — promising so far.",
+                ],
+            },
+            {
+                "frame_id": "neutral",
+                "label": "Neutral / Wait-and-See",
+                "description": (
+                    "Observers who neither endorse nor oppose. "
+                    "They track developments without strong sentiment."
+                ),
+                "initial_sentiment": 0.0,
+                "talking_points": [
+                    "Withholding judgment until more information is available.",
+                    "Both sides have valid points worth considering.",
+                    "Too early to draw conclusions.",
+                ],
+            },
+            {
+                "frame_id": "skeptical",
+                "label": "Skeptical / Critical",
+                "description": (
+                    "This group questions the narrative and scrutinises the claims "
+                    "being made. They raise concerns and highlight potential downsides."
+                ),
+                "initial_sentiment": -0.35,
+                "talking_points": [
+                    "The evidence doesn't fully support the optimism.",
+                    "We've seen this before — be cautious.",
+                    "Important questions remain unanswered.",
+                ],
+            },
+            {
+                "frame_id": "concerned",
+                "label": "Concerned / Alarmed",
+                "description": (
+                    "Deeply worried about the implications. "
+                    "They frame the story as a warning sign or threat and call for action."
+                ),
+                "initial_sentiment": -0.6,
+                "talking_points": [
+                    "This sets a dangerous precedent.",
+                    "The risks to society are being ignored.",
+                    "We need stronger oversight immediately.",
+                ],
+            },
+            {
+                "frame_id": "hostile",
+                "label": "Hostile / Oppositional",
+                "description": (
+                    "Strongly against the narrative; view it as harmful or dishonest. "
+                    "They actively try to counter or undermine it."
+                ),
+                "initial_sentiment": -0.85,
+                "talking_points": [
+                    "This is misleading and should be challenged.",
+                    "Follow the money — whose interests are being served?",
+                    "We must push back against this narrative.",
+                ],
+            },
+        ]
+
+        # Select num_frames spanning the full sentiment range
+        # Always include positive and hostile (or the most extreme available)
+        if self.num_frames >= len(template_pool):
+            selected = list(template_pool)
+        else:
+            # Evenly sample indices across the sorted pool
+            step = (len(template_pool) - 1) / max(self.num_frames - 1, 1)
+            indices = [round(i * step) for i in range(self.num_frames)]
+            selected = [template_pool[idx] for idx in indices]
+
+        frames = [
+            NarrativeFrame(
+                frame_id=t["frame_id"],
+                label=t["label"],
+                description=t["description"],
+                initial_sentiment=t["initial_sentiment"],
+                talking_points=t["talking_points"],
+            )
+            for t in selected
+        ]
+
+        logger.info(f"MultiFrameInitializer: generated {len(frames)} frames via rule-based fallback")
+        return frames
+
+    # ------------------------------------------------------------------
+    # Agent assignment logic
+    # ------------------------------------------------------------------
+
+    def _find_best_frame(
+        self, sentiment_bias: float, sorted_frames: List[NarrativeFrame]
+    ) -> NarrativeFrame:
+        """
+        Return the frame whose initial_sentiment is closest to *sentiment_bias*.
+
+        Uses simple minimum-distance matching so agents cluster naturally
+        around the frame that matches their disposition.
+        """
+        best = min(
+            sorted_frames,
+            key=lambda f: abs(f.initial_sentiment - sentiment_bias),
+        )
+        return best
 
