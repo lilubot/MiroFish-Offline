@@ -80,10 +80,21 @@ def create_app(config_class=Config):
     app.register_blueprint(simulation_bp, url_prefix='/api/simulation')
     app.register_blueprint(report_bp, url_prefix='/api/report')
 
-    # Health check
+    # Register ops/health blueprints (Prometheus monitoring layer)
+    from .routes import health_bp, ops_bp
+    app.register_blueprint(health_bp)
+    app.register_blueprint(ops_bp)
+
+    # Legacy simple health route (keep for backward compatibility)
     @app.route('/health')
     def health():
         return {'status': 'ok', 'service': 'MiroFish-Offline Backend'}
+
+    # Run startup preflight checks (logs warnings; never blocks startup)
+    from .preflight import run_preflight_checks
+    with app.app_context():
+        preflight_results = run_preflight_checks()
+        app.extensions['preflight'] = preflight_results
 
     if should_log_startup:
         logger.info("MiroFish-Offline Backend startup complete")
